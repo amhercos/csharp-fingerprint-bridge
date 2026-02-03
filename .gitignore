@@ -1,0 +1,11 @@
+# Ignore Visual Studio temporary and build files
+.vs/
+[Bb]in/
+[Oo]bj/
+*.user
+*.suo
+*.vsidx
+
+# Ensure the lib folder and its DLLs are included
+!lib/
+!lib/**/*.dll
