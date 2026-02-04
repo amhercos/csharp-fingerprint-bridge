@@ -1,39 +1,37 @@
-﻿using System;
+﻿using libzkfpcsharp;
+using Newtonsoft.Json;
+using Npgsql;
+using Sample;
+using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
 using System.Drawing;
-using System.Linq;
-using System.Text;
-using System.Windows.Forms;
-using libzkfpcsharp;
-using System.Runtime.InteropServices;
-using System.Threading;
 using System.IO;
-using Sample;
-using Npgsql;
+using System.Linq;
 using System.Net.Http;
-using Newtonsoft.Json;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Forms;
 
 namespace Demo
 {
     public partial class Form1 : Form
     {
-        // Database Connection String
+        // --- Configuration ---
         private string connString = "Host=localhost;Port=5432;Username=postgres;Password=password1;Database=fingerprint";
+        private static readonly HttpClient httpClient = new HttpClient() { Timeout = TimeSpan.FromSeconds(5) };
 
-        // Static HttpClient to reuse connections
-        private static readonly HttpClient httpClient = new HttpClient()
-        {
-            Timeout = TimeSpan.FromSeconds(5)
-        };
-
+        // --- Hardware Handles ---
         IntPtr mDevHandle = IntPtr.Zero;
         IntPtr mDBHandle = IntPtr.Zero;
         IntPtr FormHandle = IntPtr.Zero;
+
+        // --- State Management ---
         bool bIsTimeToDie = false;
         bool IsRegister = false;
-        bool bIdentify = true;
         byte[] FPBuffer;
         int RegisterCount = 0;
         const int REGISTER_FINGER_COUNT = 3;
@@ -48,6 +46,7 @@ namespace Demo
 
         private int mfpWidth = 0;
         private int mfpHeight = 0;
+        private System.Windows.Forms.Timer refreshTimer;
 
         const int MESSAGE_CAPTURED_OK = 0x0400 + 6;
 
@@ -62,79 +61,210 @@ namespace Demo
         private void Form1_Load(object sender, EventArgs e)
         {
             FormHandle = this.Handle;
+            for (int i = 0; i < 3; i++) RegTmps[i] = new byte[2048];
+
+            this.Shown += async (s, args) => {
+                UpdateStatus("Initializing SLK20R...", Color.Black);
+                await Task.Delay(500);
+                bnInit_Click(null, null);
+                if (mDevHandle == IntPtr.Zero && bnOpen.Enabled)
+                {
+                    bnOpen_Click(null, null);
+                }
+            };
         }
 
-        private void bnInit_Click(object sender, EventArgs e)
+        // --- SENSOR HARDWARE CONTROLS ---
+
+        private void ControlSensor(int code, int state)
         {
-            cmbIdx.Items.Clear();
-            int ret = zkfperrdef.ZKFP_ERR_OK;
-            if ((ret = zkfp2.Init()) == zkfperrdef.ZKFP_ERR_OK)
+            if (mDevHandle == IntPtr.Zero) return;
+            byte[] param = new byte[4];
+            zkfp2.Int2ByteArray(state, param);
+
+            // 101: Green LED, 102: Red LED, 103: Buzzer (Beep), 104: White Backlight
+            zkfp2.SetParameters(mDevHandle, code, param, 4);
+        }
+
+        private async Task TriggerFeedback(bool success)
+        {
+            if (mDevHandle == IntPtr.Zero) return;
+
+            // Step 1: Force all LEDs and Beep OFF to reset state
+            ControlSensor(101, 0);
+            ControlSensor(102, 0);
+            ControlSensor(103, 0);
+            ControlSensor(104, 0); // Turn off white light so color is vivid
+
+            if (success)
             {
-                int nCount = zkfp2.GetDeviceCount();
-                if (nCount > 0)
+                ControlSensor(101, 1); // Green ON
+                ControlSensor(103, 1); // Beep ON
+                await Task.Delay(300);
+                ControlSensor(103, 0);
+                await Task.Delay(300);
+                ControlSensor(101, 0);
+            }
+            else
+            {
+                // RED + BEEP for Conflict/Error
+                ControlSensor(102, 1); // Red ON
+                ControlSensor(103, 1); // Beep ON
+                await Task.Delay(1000); // 1-second long error signal
+                ControlSensor(103, 0);
+                ControlSensor(102, 0);
+            }
+
+            ControlSensor(104, 1); // White light back ON for next scan
+        }
+
+        // --- CORE IDENTIFICATION ---
+
+        private async void IdentifyFinger()
+        {
+            int fid = 0, score = 0;
+            int ret = zkfp2.DBIdentify(mDBHandle, CapTmp, ref fid, ref score);
+
+            if (ret == zkfp.ZKFP_ERR_OK)
+            {
+                UpdateStatus($"Local Match ID {fid}. Syncing Server...", Color.Blue);
+                bool apiResult = await NotifyWebAPI(fid);
+
+                if (apiResult)
                 {
-                    for (int i = 0; i < nCount; i++) cmbIdx.Items.Add(i.ToString());
-                    cmbIdx.SelectedIndex = 0;
-                    bnInit.Enabled = false;
-                    bnFree.Enabled = true;
-                    bnOpen.Enabled = true;
+                    UpdateStatus($"SUCCESS: Logged ID {fid}", Color.Green);
+                    await TriggerFeedback(true);
                 }
                 else
                 {
-                    zkfp2.Terminate();
-                    MessageBox.Show("No device connected!");
+                    // SERVER ERROR / CONFLICT
+                    UpdateStatus("SERVER ERROR / CONFLICT", Color.DarkRed);
+                    await TriggerFeedback(false);
                 }
             }
             else
             {
-                MessageBox.Show("Initialize fail, ret=" + ret + " !");
+                UpdateStatus("FAILED: No Match Found", Color.Red);
+                await TriggerFeedback(false);
             }
         }
 
-        private void bnOpen_Click(object sender, EventArgs e)
+        private async Task<bool> NotifyWebAPI(int identifiedFid)
         {
-            if (IntPtr.Zero == (mDevHandle = zkfp2.OpenDevice(cmbIdx.SelectedIndex)))
+            try
             {
-                MessageBox.Show("OpenDevice fail");
-                return;
+                var payload = new { FingerprintId = identifiedFid, TerminalId = 5, Timestamp = DateTime.UtcNow };
+                var content = new StringContent(JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json");
+                var response = await httpClient.PostAsync("https://master-api.amsentry.dev/api/fingerprint/log-attendance", content);
+                return response.IsSuccessStatusCode;
             }
-            if (IntPtr.Zero == (mDBHandle = zkfp2.DBInit()))
+            catch { return false; }
+        }
+
+        // --- EVENT HANDLERS (FIXES CS1061 ERRORS) ---
+
+        public void bnInit_Click(object sender, EventArgs e)
+        {
+            int ret = zkfp2.Init();
+            if (ret == zkfperrdef.ZKFP_ERR_OK)
             {
-                MessageBox.Show("Init DB fail");
-                zkfp2.CloseDevice(mDevHandle);
-                mDevHandle = IntPtr.Zero;
-                return;
+                int nCount = zkfp2.GetDeviceCount();
+                if (nCount > 0)
+                {
+                    cmbIdx.Items.Clear();
+                    for (int i = 0; i < nCount; i++) cmbIdx.Items.Add(i.ToString());
+                    cmbIdx.SelectedIndex = 0;
+                    bnInit.Enabled = false; bnOpen.Enabled = true;
+                }
             }
+        }
 
-            LoadTemplatesFromLocalDB();
-            SetNextAvailableFID();
+        public async void bnOpen_Click(object sender, EventArgs e)
+        {
+            mDevHandle = zkfp2.OpenDevice(cmbIdx.SelectedIndex);
+            if (mDevHandle != IntPtr.Zero)
+            {
+                mDBHandle = zkfp2.DBInit();
 
-            bnOpen.Enabled = false;
-            bnClose.Enabled = true;
-            bnEnroll.Enabled = true;
-            bnVerify.Enabled = true;
-            bnIdentify.Enabled = true;
+                // DISABLE AUTOMATIC HARDWARE FEEDBACK
+                byte[] disable = new byte[4];
+                zkfp2.Int2ByteArray(0, disable);
+                zkfp2.SetParameters(mDevHandle, 101, disable, 4);
+                zkfp2.SetParameters(mDevHandle, 102, disable, 4);
+                zkfp2.SetParameters(mDevHandle, 103, disable, 4);
 
-            RegisterCount = 0;
-            cbRegTmp = 0;
+                await RefreshScannersAsync();
+                SetupRefreshTimer();
 
-            for (int i = 0; i < 3; i++) RegTmps[i] = new byte[2048];
+                byte[] p = new byte[4]; int s = 4;
+                zkfp2.GetParameters(mDevHandle, 1, p, ref s); zkfp2.ByteArray2Int(p, ref mfpWidth);
+                zkfp2.GetParameters(mDevHandle, 2, p, ref s); zkfp2.ByteArray2Int(p, ref mfpHeight);
 
-            byte[] paramValue = new byte[4];
-            int size = 4;
-            zkfp2.GetParameters(mDevHandle, 1, paramValue, ref size);
-            zkfp2.ByteArray2Int(paramValue, ref mfpWidth);
-            size = 4;
-            zkfp2.GetParameters(mDevHandle, 2, paramValue, ref size);
-            zkfp2.ByteArray2Int(paramValue, ref mfpHeight);
+                FPBuffer = new byte[mfpWidth * mfpHeight];
+                bIsTimeToDie = false;
+                captureThread = new Thread(DoCapture) { IsBackground = true };
+                captureThread.Start();
 
-            FPBuffer = new byte[mfpWidth * mfpHeight];
-            bIsTimeToDie = false;
-            captureThread = new Thread(new ThreadStart(DoCapture));
-            captureThread.IsBackground = true;
-            captureThread.Start();
+                bnOpen.Enabled = false; bnClose.Enabled = true; bnEnroll.Enabled = true;
+                UpdateStatus("SYSTEM ONLINE", Color.Green);
+            }
+        }
 
-            textRes.Text = $"Device Opened. Users Loaded. Next ID: {iFid}";
+        public void bnEnroll_Click(object sender, EventArgs e) // Name matched to error log
+        {
+            if (int.TryParse(txtUserId.Text, out int customId))
+            {
+                iFid = customId; IsRegister = true; RegisterCount = 0;
+                UpdateStatus($"Enrolling ID {iFid}...", Color.Orange);
+            }
+        }
+
+        public void txtUserId_Enter(object sender, EventArgs e) // Name matched to error log
+        {
+            if (sender is TextBox tb) tb.SelectAll();
+        }
+
+        // --- BACKGROUND LOGIC ---
+
+        private async Task RefreshScannersAsync()
+        {
+            try
+            {
+                using (var conn = new NpgsqlConnection(connString))
+                {
+                    await conn.OpenAsync();
+                    zkfp2.DBClear(mDBHandle);
+                    using (var cmd = new NpgsqlCommand("SELECT user_id, template FROM user_fingerprints", conn))
+                    using (var reader = await cmd.ExecuteReaderAsync())
+                    {
+                        while (await reader.ReadAsync()) zkfp2.DBAdd(mDBHandle, reader.GetInt32(0), (byte[])reader[1]);
+                    }
+                }
+                SetNextAvailableFID();
+            }
+            catch { }
+        }
+
+        private void SetupRefreshTimer()
+        {
+            refreshTimer = new System.Windows.Forms.Timer { Interval = 1800000 };
+            refreshTimer.Tick += async (s, e) => await RefreshScannersAsync();
+            refreshTimer.Start();
+        }
+
+        private void SetNextAvailableFID()
+        {
+            try
+            {
+                using (var conn = new NpgsqlConnection(connString))
+                {
+                    conn.Open();
+                    var cmd = new NpgsqlCommand("SELECT COALESCE(MAX(user_id), 0) + 1 FROM user_fingerprints", conn);
+                    iFid = Convert.ToInt32(cmd.ExecuteScalar());
+                    this.Invoke((MethodInvoker)(() => txtUserId.Text = iFid.ToString()));
+                }
+            }
+            catch { iFid = 1; }
         }
 
         private void DoCapture()
@@ -142,302 +272,68 @@ namespace Demo
             while (!bIsTimeToDie)
             {
                 cbCapTmp = 2048;
-                int ret = zkfp2.AcquireFingerprint(mDevHandle, FPBuffer, CapTmp, ref cbCapTmp);
-                if (ret == zkfp.ZKFP_ERR_OK)
-                {
+                if (zkfp2.AcquireFingerprint(mDevHandle, FPBuffer, CapTmp, ref cbCapTmp) == 0)
                     SendMessage(FormHandle, MESSAGE_CAPTURED_OK, IntPtr.Zero, IntPtr.Zero);
-                }
                 Thread.Sleep(200);
             }
         }
 
         protected override void DefWndProc(ref Message m)
         {
-            switch (m.Msg)
+            if (m.Msg == MESSAGE_CAPTURED_OK)
             {
-                case MESSAGE_CAPTURED_OK:
-                    {
-                        MemoryStream ms = new MemoryStream();
-                        BitmapFormat.GetBitmap(FPBuffer, mfpWidth, mfpHeight, ref ms);
-                        this.picFPImg.Image = new Bitmap(ms);
-
-                        if (IsRegister)
-                        {
-                            int ret = zkfp.ZKFP_ERR_OK;
-                            int fid = 0, score = 0;
-
-                            ret = zkfp2.DBIdentify(mDBHandle, CapTmp, ref fid, ref score);
-                            if (zkfp.ZKFP_ERR_OK == ret)
-                            {
-                                textRes.Text = "This finger is already registered with ID: " + fid;
-                                IsRegister = false;
-                                RegisterCount = 0;
-                                return;
-                            }
-
-                            if (RegisterCount > 0 && zkfp2.DBMatch(mDBHandle, CapTmp, RegTmps[RegisterCount - 1]) <= 0)
-                            {
-                                textRes.Text = "Please press the SAME finger.";
-                                return;
-                            }
-
-                            Array.Copy(CapTmp, RegTmps[RegisterCount], cbCapTmp);
-                            RegisterCount++;
-
-                            if (RegisterCount >= REGISTER_FINGER_COUNT)
-                            {
-                                cbRegTmp = 2048;
-                                ret = zkfp2.DBMerge(mDBHandle, RegTmps[0], RegTmps[1], RegTmps[2], RegTmp, ref cbRegTmp);
-
-                                if (zkfp.ZKFP_ERR_OK == ret)
-                                {
-                                    zkfp2.DBAdd(mDBHandle, iFid, RegTmp);
-                                    SaveToDatabase(iFid, RegTmp);
-
-                                    textRes.Text = "Enrollment Success! User ID: " + iFid;
-                                    // Optionally update iFid for the next auto-suggestion
-                                    SetNextAvailableFID();
-                                }
-                                else
-                                {
-                                    textRes.Text = "Merge failed, error: " + ret;
-                                }
-                                IsRegister = false;
-                                RegisterCount = 0;
-                            }
-                            else
-                            {
-                                textRes.Text = "Remaining presses: " + (REGISTER_FINGER_COUNT - RegisterCount);
-                            }
-                        }
-                        else
-                        {
-                            IdentifyFinger();
-                        }
-                    }
-                    break;
-                default:
-                    base.DefWndProc(ref m);
-                    break;
+                MemoryStream ms = new MemoryStream();
+                BitmapFormat.GetBitmap(FPBuffer, mfpWidth, mfpHeight, ref ms);
+                picFPImg.Image = new Bitmap(ms);
+                if (IsRegister) ProcessEnrollment(); else IdentifyFinger();
             }
+            else base.DefWndProc(ref m);
         }
 
-        // --- NEW METHOD: Checks if ID exists in Postgres ---
-        private bool DoesUserExist(int userId)
+        private void ProcessEnrollment()
         {
-            try
+            Array.Copy(CapTmp, RegTmps[RegisterCount], cbCapTmp);
+            RegisterCount++;
+            ControlSensor(101, 1); Thread.Sleep(100); ControlSensor(101, 0);
+
+            if (RegisterCount >= REGISTER_FINGER_COUNT)
             {
-                using (NpgsqlConnection conn = new NpgsqlConnection(connString))
+                cbRegTmp = 2048;
+                if (zkfp2.DBMerge(mDBHandle, RegTmps[0], RegTmps[1], RegTmps[2], RegTmp, ref cbRegTmp) == zkfp.ZKFP_ERR_OK)
                 {
-                    conn.Open();
-                    string sql = "SELECT COUNT(1) FROM user_fingerprints WHERE user_id = @id";
-                    using (NpgsqlCommand cmd = new NpgsqlCommand(sql, conn))
-                    {
-                        cmd.Parameters.AddWithValue("id", userId);
-                        long count = (long)cmd.ExecuteScalar();
-                        return count > 0;
-                    }
+                    zkfp2.DBAdd(mDBHandle, iFid, RegTmp);
+                    SaveToDatabase(iFid, RegTmp);
+                    UpdateStatus("Enroll Success!", Color.Green);
+                    IsRegister = false; SetNextAvailableFID();
                 }
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show("Error checking database: " + ex.Message);
-                return true; // Stop enrollment if DB is unreachable
+                else { UpdateStatus("Merge Fail", Color.Red); IsRegister = false; }
             }
         }
 
         private void SaveToDatabase(int userId, byte[] template)
         {
-            try
+            using (var conn = new NpgsqlConnection(connString))
             {
-                using (NpgsqlConnection conn = new NpgsqlConnection(connString))
-                {
-                    conn.Open();
-                    // We use ON CONFLICT as a safety net, but our button check prevents this usually
-                    string sql = "INSERT INTO user_fingerprints (user_id, template) VALUES (@id, @tmp) " +
-                                 "ON CONFLICT (user_id) DO UPDATE SET template = @tmp";
-
-                    using (NpgsqlCommand cmd = new NpgsqlCommand(sql, conn))
-                    {
-                        cmd.Parameters.AddWithValue("id", userId);
-                        cmd.Parameters.AddWithValue("tmp", template);
-                        cmd.ExecuteNonQuery();
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show("Database Save Failed: " + ex.Message);
+                conn.Open();
+                var cmd = new NpgsqlCommand("INSERT INTO user_fingerprints (user_id, template) VALUES (@id, @tmp) ON CONFLICT (user_id) DO UPDATE SET template = @tmp", conn);
+                cmd.Parameters.AddWithValue("id", userId); cmd.Parameters.AddWithValue("tmp", template);
+                cmd.ExecuteNonQuery();
             }
         }
 
-        private void IdentifyFinger()
+        private void UpdateStatus(string text, Color color)
         {
-            int fid = 0, score = 0;
-            int ret = zkfp2.DBIdentify(mDBHandle, CapTmp, ref fid, ref score);
-
-            if (zkfp.ZKFP_ERR_OK == ret)
-            {
-                // 1. Update the UI immediately so you know the hardware worked
-                textRes.Text = "Matched ID: " + fid + " (Score: " + score + ")";
-
-                // 2. Trigger the Cloud Call
-                NotifyWebAPI(fid);
-            }
-            else
-            {
-                textRes.Text = "No match found.";
-            }
+            if (this.InvokeRequired) { this.Invoke(new MethodInvoker(() => UpdateStatus(text, color))); return; }
+            textRes.AppendText(Environment.NewLine + text);
+            textRes.ForeColor = color;
+            textRes.SelectionStart = textRes.TextLength;
+            textRes.ScrollToCaret();
         }
 
-    private async void NotifyWebAPI(int identifiedFid)
-        {
-            try
-            {
-                var payload = new
-                {
-                    FingerprintId = identifiedFid,
-                    TerminalId = 5,
-                    Timestamp = DateTime.UtcNow
-                };
-
-                string json = JsonConvert.SerializeObject(payload);
-                var content = new StringContent(json, Encoding.UTF8, "application/json");
-
-                // DOUBLE CHECK THIS URL - If it's wrong, the code jumps to the 'catch' block
-                string apiUrl = "https://master-api.amsentry.dev/api/fingerprint/log-attendance";
-
-                var response = await httpClient.PostAsync(apiUrl, content);
-
-                this.BeginInvoke((MethodInvoker)delegate {
-                    if (response.IsSuccessStatusCode)
-                    {
-                        textRes.Text += " - Cloud Updated!";
-                        textRes.ForeColor = Color.Green;
-                    }
-                    else
-                    {
-                        // This will tell us if it's 401 (Unauthorized) or 404 (Not Found)
-                        textRes.Text += $" - API Error: {(int)response.StatusCode}";
-                        textRes.ForeColor = Color.Orange;
-                    }
-                });
-            }
-            catch (Exception ex)
-            {
-                this.BeginInvoke((MethodInvoker)delegate {
-                    textRes.Text += " - Connection Failed!";
-                    // This shows the actual error (e.g., "No such host is known")
-                    MessageBox.Show("Cloud Error: " + ex.Message);
-                });
-            }
-        }
-
-        private void LoadTemplatesFromLocalDB()
-        {
-            try
-            {
-                using (NpgsqlConnection conn = new NpgsqlConnection(connString))
-                {
-                    conn.Open();
-                    string sql = "SELECT user_id, template FROM user_fingerprints";
-                    using (NpgsqlCommand cmd = new NpgsqlCommand(sql, conn))
-                    using (NpgsqlDataReader reader = cmd.ExecuteReader())
-                    {
-                        while (reader.Read())
-                        {
-                            int id = reader.GetInt32(0);
-                            byte[] tmp = (byte[])reader[1];
-                            zkfp2.DBAdd(mDBHandle, id, tmp);
-                        }
-                    }
-                }
-            }
-            catch (Exception ex) { MessageBox.Show("Loader Error: " + ex.Message); }
-        }
-
-        private void SetNextAvailableFID()
-        {
-            try
-            {
-                using (NpgsqlConnection conn = new NpgsqlConnection(connString))
-                {
-                    conn.Open();
-                    string sql = "SELECT COALESCE(MAX(user_id), 0) + 1 FROM user_fingerprints";
-                    using (NpgsqlCommand cmd = new NpgsqlCommand(sql, conn))
-                    {
-                        iFid = Convert.ToInt32(cmd.ExecuteScalar());
-                        // Suggest the next ID in the textbox automatically
-                        txtUserId.Text = iFid.ToString();
-                    }
-                }
-            }
-            catch { iFid = 1; }
-        }
-
-        // --- UPDATED ENROLL BUTTON WITH VALIDATION ---
-        private void bnEnroll_Click(object sender, EventArgs e)
-        {
-            if (mDevHandle == IntPtr.Zero)
-            {
-                MessageBox.Show("Please open device first.");
-                return;
-            }
-
-            if (string.IsNullOrWhiteSpace(txtUserId.Text))
-            {
-                MessageBox.Show("Please type a User ID.");
-                return;
-            }
-
-            if (int.TryParse(txtUserId.Text, out int customId))
-            {
-                // Check if ID is already in the database
-                if (DoesUserExist(customId))
-                {
-                    MessageBox.Show($"User ID {customId} already exists! Choose a different ID.");
-                    return;
-                }
-
-                iFid = customId;
-                IsRegister = true;
-                RegisterCount = 0;
-                textRes.Text = $"Enrollment Started for ID {iFid}: Press finger 3 times.";
-            }
-            else
-            {
-                MessageBox.Show("Invalid ID. Please enter numbers only.");
-            }
-        }
-
-        private void bnClose_Click(object sender, EventArgs e)
-        {
-            bIsTimeToDie = true;
-            Thread.Sleep(500);
-            zkfp2.CloseDevice(mDevHandle);
-            mDevHandle = IntPtr.Zero;
-            bnOpen.Enabled = true;
-            bnClose.Enabled = false;
-            textRes.Text = "Device Closed.";
-        }
-
-        private void bnFree_Click(object sender, EventArgs e)
-        {
-            zkfp2.Terminate();
-            bnInit.Enabled = true;
-            bnFree.Enabled = false;
-        }
-
-        private void bnVerify_Click(object sender, EventArgs e) { bIdentify = false; IsRegister = false; }
-        private void bnIdentify_Click(object sender, EventArgs e) { bIdentify = true; IsRegister = false; }
-        private void txtUserId_Enter(object sender, EventArgs e)
-        {
-            // Clear the status label
-            textRes.Text = "Waiting for ID...";
-            textRes.ForeColor = Color.Black;
-
-            // Optional: Select all text so you can just start typing over the old ID
-            txtUserId.SelectAll();
-        }
+        // DESIGNER PLACEHOLDERS
+        public void bnClose_Click(object sender, EventArgs e) { bIsTimeToDie = true; zkfp2.CloseDevice(mDevHandle); mDevHandle = IntPtr.Zero; }
+        public void bnFree_Click(object sender, EventArgs e) { zkfp2.Terminate(); }
+        public void bnVerify_Click(object sender, EventArgs e) { IsRegister = false; }
+        public void bnIdentify_Click(object sender, EventArgs e) { IsRegister = false; }
     }
 }
