@@ -36,73 +36,35 @@ namespace fingerprint_bridge.Services
             {
                 var json = JsonConvert.SerializeObject(req);
                 var content = new StringContent(json, Encoding.UTF8, "application/json");
-
                 var response = await _httpClient.PostAsync("https://master-api.amsentry.dev/api/fingerprint/log-attendance", content);
 
                 if (response.IsSuccessStatusCode)
                     return new SyncResult { IsSuccess = true, IsNetworkError = false, Message = "Success" };
 
-                // 400-499: Logic errors (User not found, etc.)
                 if ((int)response.StatusCode >= 400 && (int)response.StatusCode < 500)
-                {
-                    string errorDetail = await response.Content.ReadAsStringAsync();
                     return new SyncResult { IsSuccess = false, IsNetworkError = false, Message = $"Rejected: {response.StatusCode}" };
-                }
 
                 return new SyncResult { IsSuccess = false, IsNetworkError = true, Message = "Server Error" };
             }
-            catch (HttpRequestException) { return new SyncResult { IsSuccess = false, IsNetworkError = true, Message = "Network Down" }; }
-            catch (Exception ex) { return new SyncResult { IsSuccess = false, IsNetworkError = true, Message = ex.Message }; }
+            catch { return new SyncResult { IsSuccess = false, IsNetworkError = true, Message = "Network Down" }; }
         }
 
-        public void AddToQueue(AttendanceRequest req)
-        {
-            lock (_lock)
-            {
-                _offlineQueue.Add(req);
-                PersistQueue();
-            }
-        }
-
-        public List<AttendanceRequest> GetQueue()
-        {
-            lock (_lock) return new List<AttendanceRequest>(_offlineQueue);
-        }
-
-        public void RemoveFromQueue(AttendanceRequest req)
-        {
-            lock (_lock)
-            {
-                _offlineQueue.Remove(req);
-                PersistQueue();
-            }
-        }
+        public void AddToQueue(AttendanceRequest req) { lock (_lock) { _offlineQueue.Add(req); PersistQueue(); } }
+        public List<AttendanceRequest> GetQueue() { lock (_lock) return new List<AttendanceRequest>(_offlineQueue); }
+        public void RemoveFromQueue(AttendanceRequest req) { lock (_lock) { _offlineQueue.Remove(req); PersistQueue(); } }
 
         private void LoadQueue()
         {
-            try
-            {
-                if (File.Exists(_queueFilePath))
+            if (File.Exists(_queueFilePath)) try
                 {
-                    string json = File.ReadAllText(_queueFilePath);
-                    var data = JsonConvert.DeserializeObject<List<AttendanceRequest>>(json);
-                    if (data != null) _offlineQueue = data;
+                    _offlineQueue = JsonConvert.DeserializeObject<List<AttendanceRequest>>(File.ReadAllText(_queueFilePath)) ?? new List<AttendanceRequest>();
                 }
-            }
-            catch { }
+                catch { }
         }
 
         public void PersistQueue()
         {
-            try
-            {
-                lock (_lock)
-                {
-                    string json = JsonConvert.SerializeObject(_offlineQueue, Formatting.Indented);
-                    File.WriteAllText(_queueFilePath, json);
-                }
-            }
-            catch { }
+            lock (_lock) File.WriteAllText(_queueFilePath, JsonConvert.SerializeObject(_offlineQueue, Formatting.Indented));
         }
     }
 }

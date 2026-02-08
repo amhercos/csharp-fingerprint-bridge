@@ -9,6 +9,8 @@ namespace fingerprint_bridge.Models
     public class FingerprintTemplate
     {
         public int UserId { get; set; }
+        public string FirstName { get; set; }
+        public string LastName { get; set; }
         public byte[] Template { get; set; }
     }
 }
