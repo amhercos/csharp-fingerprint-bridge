@@ -2,7 +2,7 @@ using System;
 using System.Runtime.InteropServices;
 using System.IO;
 
-namespace Sample
+namespace fingerprint_bridge
 {
     public class BitmapFormat
     {
