@@ -304,8 +304,13 @@
     <Compile Include="Form1.Designer.cs">
       <DependentUpon>Form1.cs</DependentUpon>
     </Compile>
+    <Compile Include="Models\AppSettings.cs" />
+    <Compile Include="Models\AttendanceRequest.cs" />
+    <Compile Include="Models\FingerprintTemplate.cs" />
     <Compile Include="Program.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
+    <Compile Include="Services\AttendanceSyncService.cs" />
+    <Compile Include="Services\DatabaseService.cs" />
     <EmbeddedResource Include="Form1.resx">
       <DependentUpon>Form1.cs</DependentUpon>
     </EmbeddedResource>
