@@ -54,17 +54,14 @@ namespace fingerprint_bridge
 
             zkfp2.Init();
 
-            // Watchdog to auto-connect hardware
             var watchdog = new System.Windows.Forms.Timer { Interval = 5000 };
             watchdog.Tick += async (s, e) => await CheckHardwareStatus();
             watchdog.Start();
 
-            // Background sync for offline records
             var retryTimer = new System.Windows.Forms.Timer { Interval = 20000 };
             retryTimer.Tick += async (s, e) => await ProcessOfflineQueueAsync();
             retryTimer.Start();
 
-            // Start with buttons disabled until scanner is ready
             ToggleControls(false);
         }
 
@@ -108,10 +105,7 @@ namespace fingerprint_bridge
                     captureThread.Start();
 
                     UpdateStatus("Scanner Ready.", Color.Green);
-
-                    // Enable buttons on UI thread
                     this.Invoke(new Action(() => ToggleControls(true)));
-
                     Task.Run(() => SyncTemplatesBackground());
                 }
             }
@@ -173,24 +167,30 @@ namespace fingerprint_bridge
 
                 var result = await _syncService.SendAttendanceAsync(req);
 
-                if (result.IsSuccess)
+                if (result != null && (result.IsSuccess || result.IsNetworkError))
                 {
-                    UpdateStatus($"[Cloud] Logged: {fullName}", Color.Green);
-                    await TriggerFeedback(true);
-                }
-                else if (result.IsNetworkError)
-                {
-                    _syncService.AddToQueue(req);
-                    UpdateStatus($"[Offline] {fullName} queued (No Internet)", Color.Orange);
-                    await TriggerFeedback(true);
+                    if (result.IsNetworkError)
+                    {
+                        _syncService.AddToQueue(req);
+                        UpdateStatus($"[Offline] {fullName} queued (No Internet)", Color.Orange);
+                    }
+                    else
+                    {
+                        UpdateStatus($"[Cloud] Logged: {fullName}", Color.Green);
+                    }
+                    await TriggerFeedback(true); // SET GREEN
                 }
                 else
                 {
-                    UpdateStatus($"[API Error] {result.Message}", Color.Red);
-                    await TriggerFeedback(false);
+                    UpdateStatus($"[API Error] {result?.Message ?? "Unknown"}", Color.Red);
+                    await TriggerFeedback(false); // SET RED
                 }
             }
-            else { UpdateStatus("Verify Failed: Unknown Finger.", Color.DarkRed); await TriggerFeedback(false); }
+            else
+            {
+                UpdateStatus("Verify Failed: Unknown Finger.", Color.DarkRed);
+                await TriggerFeedback(false); // SET RED
+            }
         }
 
         private void HandleEnroll()
@@ -209,7 +209,6 @@ namespace fingerprint_bridge
 
                     UpdateStatus($"Enroll Success: {fName} {lName} (ID: {iFid})", Color.Green);
 
-                    // Clear fields
                     txtFirstName.Clear();
                     txtLastName.Clear();
                     txtUserId.Clear();
@@ -217,8 +216,15 @@ namespace fingerprint_bridge
                     Task.Run(() => SyncTemplatesBackground());
                     IsRegister = false;
                     RegisterCount = 0;
+                    _ = TriggerFeedback(true);
                 }
-                else { UpdateStatus("Enroll Failed: Low quality. Try again.", Color.Red); IsRegister = false; RegisterCount = 0; }
+                else
+                {
+                    UpdateStatus("Enroll Failed: Low quality. Try again.", Color.Red);
+                    IsRegister = false;
+                    RegisterCount = 0;
+                    _ = TriggerFeedback(false);
+                }
             }
             else
             {
@@ -283,16 +289,49 @@ namespace fingerprint_bridge
             else base.DefWndProc(ref m);
         }
 
+        /// <summary>
+        /// Updates Physical Scanner Lights and Buzzer based on Documentation:
+        /// 101: Green LED, 102: Red LED, 103: Buzzer
+        /// </summary>
         private async Task TriggerFeedback(bool success)
         {
             if (mDevHandle == IntPtr.Zero) return;
-            byte[] p = new byte[4];
-            zkfp2.Int2ByteArray(success ? 1 : 0, p); zkfp2.SetParameters(mDevHandle, 101, p, 4); // Green
-            zkfp2.Int2ByteArray(!success ? 1 : 0, p); zkfp2.SetParameters(mDevHandle, 102, p, 4); // Red
-            zkfp2.Int2ByteArray(1, p); zkfp2.SetParameters(mDevHandle, 103, p, 4); // Beep
-            await Task.Delay(500);
-            zkfp2.Int2ByteArray(0, p);
-            zkfp2.SetParameters(mDevHandle, 101, p, 4); zkfp2.SetParameters(mDevHandle, 102, p, 4); zkfp2.SetParameters(mDevHandle, 103, p, 4);
+
+            byte[] on = new byte[4]; zkfp2.Int2ByteArray(1, on);
+            byte[] off = new byte[4]; zkfp2.Int2ByteArray(0, off);
+
+            // Corrected Parameter Codes based on SDK Section 6.1:
+            // 102: Green LED
+            // 103: Red LED
+            // 104: Buzzer
+
+            // Step 1: Force Reset
+            zkfp2.SetParameters(mDevHandle, 102, off, 4); // Green Off
+            zkfp2.SetParameters(mDevHandle, 103, off, 4); // Red Off
+            zkfp2.SetParameters(mDevHandle, 104, off, 4); // Buzzer Off
+
+            await Task.Delay(30);
+
+            if (success)
+            {
+                // 102 is Green
+                zkfp2.SetParameters(mDevHandle, 102, on, 4);
+            }
+            else
+            {
+                // 103 is Red
+                zkfp2.SetParameters(mDevHandle, 103, on, 4);
+            }
+
+            // 104 is Buzzer
+            zkfp2.SetParameters(mDevHandle, 104, on, 4);
+
+            await Task.Delay(1000);
+
+            // Cleanup
+            zkfp2.SetParameters(mDevHandle, 102, off, 4);
+            zkfp2.SetParameters(mDevHandle, 103, off, 4);
+            zkfp2.SetParameters(mDevHandle, 104, off, 4);
         }
 
         public void bnInit_Click(object sender, EventArgs e) => _ = CheckHardwareStatus();
@@ -332,11 +371,7 @@ namespace fingerprint_bridge
             UpdateStatus("Scanner Closed.", Color.Red);
         }
 
-        private void label4_Click(object sender, EventArgs e)
-        {
-
-        }
-
+        private void label4_Click(object sender, EventArgs e) { }
         private void txtFirstName_TextChanged(object sender, EventArgs e) { }
         private void txtLastName_TextChanged(object sender, EventArgs e) { }
     }
