@@ -54,7 +54,8 @@ namespace fingerprint_bridge
 
             zkfp2.Init();
 
-            var watchdog = new System.Windows.Forms.Timer { Interval = 5000 };
+            // Watchdog: Fixed to properly re-init the SDK when device is found
+            var watchdog = new System.Windows.Forms.Timer { Interval = 3000 };
             watchdog.Tick += async (s, e) => await CheckHardwareStatus();
             watchdog.Start();
 
@@ -69,6 +70,8 @@ namespace fingerprint_bridge
         {
             mFormHandle = this.Handle;
             for (int i = 0; i < 3; i++) RegTmps[i] = new byte[2048];
+            _ = CheckHardwareStatus();
+
             this.FormClosing += (s, args) => {
                 bIsTimeToDie = true;
                 _syncService.PersistQueue();
@@ -80,7 +83,17 @@ namespace fingerprint_bridge
         private async Task CheckHardwareStatus()
         {
             if (mDevHandle != IntPtr.Zero || _isInitializing) return;
-            if (zkfp2.GetDeviceCount() > 0)
+
+            // Try to find device. If not found, reset SDK to refresh the USB stack.
+            int count = zkfp2.GetDeviceCount();
+            if (count <= 0)
+            {
+                zkfp2.Terminate();
+                zkfp2.Init();
+                count = zkfp2.GetDeviceCount();
+            }
+
+            if (count > 0)
             {
                 _isInitializing = true;
                 InitializeScannerHardware();
@@ -98,6 +111,7 @@ namespace fingerprint_bridge
                     zkfp2.GetParameters(mDevHandle, 1, p, ref s2); zkfp2.ByteArray2Int(p, ref mfpWidth);
                     zkfp2.GetParameters(mDevHandle, 2, p, ref s2); zkfp2.ByteArray2Int(p, ref mfpHeight);
                     FPBuffer = new byte[mfpWidth * mfpHeight];
+
                     if (mDBHandle == IntPtr.Zero) mDBHandle = zkfp2.DBInit();
 
                     bIsTimeToDie = false;
@@ -141,7 +155,7 @@ namespace fingerprint_bridge
                 int cb = 2048;
                 int ret = zkfp2.AcquireFingerprint(mDevHandle, FPBuffer, CapTmp, ref cb);
                 if (ret == 0) SendMessage(mFormHandle, MESSAGE_CAPTURED_OK, IntPtr.Zero, IntPtr.Zero);
-                else if (ret == -7)
+                else if (ret == -7) // Hardware connection lost
                 {
                     UpdateStatus("Hardware Disconnected.", Color.Red);
                     this.Invoke(new Action(() => ToggleControls(false)));
@@ -161,12 +175,11 @@ namespace fingerprint_bridge
             {
                 var user = _userCache.FirstOrDefault(u => u.UserId == fid);
                 string fullName = user != null ? $"{user.FirstName} {user.LastName}".Trim() : $"User {fid}";
-
                 var req = new AttendanceRequest { FingerprintId = fid, TerminalId = _settings.TerminalId, Timestamp = DateTime.UtcNow };
+
                 UpdateStatus($"Verified: {fullName} (Score: {score})", Color.Blue);
 
                 var result = await _syncService.SendAttendanceAsync(req);
-
                 if (result != null && (result.IsSuccess || result.IsNetworkError))
                 {
                     if (result.IsNetworkError)
@@ -178,18 +191,18 @@ namespace fingerprint_bridge
                     {
                         UpdateStatus($"[Cloud] Logged: {fullName}", Color.Green);
                     }
-                    await TriggerFeedback(true); // SET GREEN
+                    await TriggerFeedback(true);
                 }
                 else
                 {
                     UpdateStatus($"[API Error] {result?.Message ?? "Unknown"}", Color.Red);
-                    await TriggerFeedback(false); // SET RED
+                    await TriggerFeedback(false);
                 }
             }
             else
             {
                 UpdateStatus("Verify Failed: Unknown Finger.", Color.DarkRed);
-                await TriggerFeedback(false); // SET RED
+                await TriggerFeedback(false);
             }
         }
 
@@ -203,49 +216,36 @@ namespace fingerprint_bridge
                 {
                     string fName = txtFirstName.Text.Trim();
                     string lName = txtLastName.Text.Trim();
-
                     zkfp2.DBAdd(mDBHandle, iFid, RegTmp);
                     _dbService.SaveTemplate(iFid, fName, lName, RegTmp);
-
                     UpdateStatus($"Enroll Success: {fName} {lName} (ID: {iFid})", Color.Green);
 
-                    txtFirstName.Clear();
-                    txtLastName.Clear();
-                    txtUserId.Clear();
-
+                    txtFirstName.Clear(); txtLastName.Clear(); txtUserId.Clear();
                     Task.Run(() => SyncTemplatesBackground());
-                    IsRegister = false;
-                    RegisterCount = 0;
+                    IsRegister = false; RegisterCount = 0;
                     _ = TriggerFeedback(true);
                 }
                 else
                 {
                     UpdateStatus("Enroll Failed: Low quality. Try again.", Color.Red);
-                    IsRegister = false;
-                    RegisterCount = 0;
+                    IsRegister = false; RegisterCount = 0;
                     _ = TriggerFeedback(false);
                 }
             }
-            else
-            {
-                UpdateStatus($"Scan {RegisterCount}/3 successful. Tap again...", Color.Blue);
-            }
+            else UpdateStatus($"Scan {RegisterCount}/3 successful. Tap again...", Color.Blue);
         }
 
         private async Task ProcessOfflineQueueAsync()
         {
             var queue = _syncService.GetQueue();
             if (queue.Count == 0) return;
-
             int successCount = 0;
             foreach (var req in queue)
             {
                 var res = await _syncService.SendAttendanceAsync(req);
                 if (res.IsSuccess) { _syncService.RemoveFromQueue(req); successCount++; }
                 else if (res.IsNetworkError) break;
-                else _syncService.RemoveFromQueue(req);
             }
-
             if (successCount > 0) UpdateStatus($"[Sync] Backlog: {successCount} records uploaded.", Color.Teal);
         }
 
@@ -289,46 +289,18 @@ namespace fingerprint_bridge
             else base.DefWndProc(ref m);
         }
 
-        /// <summary>
-        /// Updates Physical Scanner Lights and Buzzer based on Documentation:
-        /// 101: Green LED, 102: Red LED, 103: Buzzer
-        /// </summary>
         private async Task TriggerFeedback(bool success)
         {
             if (mDevHandle == IntPtr.Zero) return;
-
             byte[] on = new byte[4]; zkfp2.Int2ByteArray(1, on);
             byte[] off = new byte[4]; zkfp2.Int2ByteArray(0, off);
-
-            // Corrected Parameter Codes based on SDK Section 6.1:
-            // 102: Green LED
-            // 103: Red LED
-            // 104: Buzzer
-
-            // Step 1: Force Reset
-            zkfp2.SetParameters(mDevHandle, 102, off, 4); // Green Off
-            zkfp2.SetParameters(mDevHandle, 103, off, 4); // Red Off
-            zkfp2.SetParameters(mDevHandle, 104, off, 4); // Buzzer Off
-
+            zkfp2.SetParameters(mDevHandle, 102, off, 4);
+            zkfp2.SetParameters(mDevHandle, 103, off, 4);
+            zkfp2.SetParameters(mDevHandle, 104, off, 4);
             await Task.Delay(30);
-
-            if (success)
-            {
-                // 102 is Green
-                zkfp2.SetParameters(mDevHandle, 102, on, 4);
-            }
-            else
-            {
-                // 103 is Red
-                zkfp2.SetParameters(mDevHandle, 103, on, 4);
-            }
-
-            // 104 is Buzzer
+            if (success) zkfp2.SetParameters(mDevHandle, 102, on, 4); else zkfp2.SetParameters(mDevHandle, 103, on, 4);
             zkfp2.SetParameters(mDevHandle, 104, on, 4);
-
             await Task.Delay(1000);
-
-            // Cleanup
             zkfp2.SetParameters(mDevHandle, 102, off, 4);
             zkfp2.SetParameters(mDevHandle, 103, off, 4);
             zkfp2.SetParameters(mDevHandle, 104, off, 4);
@@ -337,39 +309,14 @@ namespace fingerprint_bridge
         public void bnInit_Click(object sender, EventArgs e) => _ = CheckHardwareStatus();
         public void bnOpen_Click(object sender, EventArgs e) => _ = CheckHardwareStatus();
         public void btnClearLogs_Click(object sender, EventArgs e) => textRes.Clear();
-
         public void bnEnroll_Click(object sender, EventArgs e)
         {
-            if (string.IsNullOrWhiteSpace(txtFirstName.Text))
-            {
-                UpdateStatus("Error: First Name is required.", Color.Red);
-                return;
-            }
-
-            if (!int.TryParse(txtUserId.Text, out iFid))
-            {
-                iFid = (_userCache.Count > 0) ? _userCache.Max(u => u.UserId) + 1 : 1;
-                txtUserId.Text = iFid.ToString();
-            }
-
-            IsRegister = true;
-            RegisterCount = 0;
-            UpdateStatus($"Enrollment started for {txtFirstName.Text}. Tap 3 times.", Color.Orange);
+            if (string.IsNullOrWhiteSpace(txtFirstName.Text)) { UpdateStatus("Error: First Name is required.", Color.Red); return; }
+            if (!int.TryParse(txtUserId.Text, out iFid)) { iFid = (_userCache.Count > 0) ? _userCache.Max(u => u.UserId) + 1 : 1; txtUserId.Text = iFid.ToString(); }
+            IsRegister = true; RegisterCount = 0; UpdateStatus($"Enrollment started for {txtFirstName.Text}. Tap 3 times.", Color.Orange);
         }
-
-        public void bnVerify_Click(object sender, EventArgs e)
-        {
-            IsRegister = false;
-            UpdateStatus("Mode: Verification.", Color.Black);
-        }
-
-        public void bnClose_Click(object sender, EventArgs e)
-        {
-            bIsTimeToDie = true;
-            CleanupDevice();
-            ToggleControls(false);
-            UpdateStatus("Scanner Closed.", Color.Red);
-        }
+        public void bnVerify_Click(object sender, EventArgs e) { IsRegister = false; UpdateStatus("Mode: Verification.", Color.Black); }
+        public void bnClose_Click(object sender, EventArgs e) { bIsTimeToDie = true; CleanupDevice(); ToggleControls(false); UpdateStatus("Scanner Closed.", Color.Red); }
 
         private void label4_Click(object sender, EventArgs e) { }
         private void txtFirstName_TextChanged(object sender, EventArgs e) { }
