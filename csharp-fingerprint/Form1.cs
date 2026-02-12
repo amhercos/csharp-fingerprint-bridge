@@ -36,6 +36,11 @@ namespace fingerprint_bridge
         private const int MESSAGE_CAPTURED_OK = 0x0400 + 6;
         private bool _isInitializing = false;
 
+        // Debounce variables
+        private int _lastVerifiedFid = -1;
+        private DateTime _lastScanTime = DateTime.MinValue;
+        private const int DEBOUNCE_SECONDS = 5;
+
         [DllImport("user32.dll", EntryPoint = "SendMessageA")]
         public static extern int SendMessage(IntPtr hwnd, int wMsg, IntPtr wParam, IntPtr lParam);
 
@@ -54,7 +59,6 @@ namespace fingerprint_bridge
 
             zkfp2.Init();
 
-            // Watchdog: Fixed to properly re-init the SDK when device is found
             var watchdog = new System.Windows.Forms.Timer { Interval = 3000 };
             watchdog.Tick += async (s, e) => await CheckHardwareStatus();
             watchdog.Start();
@@ -84,7 +88,6 @@ namespace fingerprint_bridge
         {
             if (mDevHandle != IntPtr.Zero || _isInitializing) return;
 
-            // Try to find device. If not found, reset SDK to refresh the USB stack.
             int count = zkfp2.GetDeviceCount();
             if (count <= 0)
             {
@@ -139,12 +142,20 @@ namespace fingerprint_bridge
         {
             try
             {
+                UpdateStatus("Connecting to Office Server...", Color.Orange);
                 _userCache = await _dbService.GetAllTemplatesAsync();
+
                 zkfp2.DBClear(mDBHandle);
-                foreach (var item in _userCache) zkfp2.DBAdd(mDBHandle, item.UserId, item.Template);
-                UpdateStatus($"Sync: Loaded {_userCache.Count} users.", Color.DimGray);
+                foreach (var item in _userCache)
+                {
+                    zkfp2.DBAdd(mDBHandle, item.UserId, item.Template);
+                }
+                UpdateStatus($"Sync Complete: {_userCache.Count} templates loaded.", Color.Green);
             }
-            catch (Exception ex) { UpdateStatus($"Sync Error: {ex.Message}", Color.Red); }
+            catch (Exception ex)
+            {
+                UpdateStatus($"Sync Error: Ensure Office Server is reachable. {ex.Message}", Color.Red);
+            }
         }
 
         private void DoCapture()
@@ -155,7 +166,7 @@ namespace fingerprint_bridge
                 int cb = 2048;
                 int ret = zkfp2.AcquireFingerprint(mDevHandle, FPBuffer, CapTmp, ref cb);
                 if (ret == 0) SendMessage(mFormHandle, MESSAGE_CAPTURED_OK, IntPtr.Zero, IntPtr.Zero);
-                else if (ret == -7) // Hardware connection lost
+                else if (ret == -7)
                 {
                     UpdateStatus("Hardware Disconnected.", Color.Red);
                     this.Invoke(new Action(() => ToggleControls(false)));
@@ -173,6 +184,15 @@ namespace fingerprint_bridge
 
             if (ret == zkfp.ZKFP_ERR_OK)
             {
+                // Debounce Logic: Check if it's the same person within the cooldown window
+                bool isSameUser = (fid == _lastVerifiedFid);
+                double secondsSinceLastScan = (DateTime.Now - _lastScanTime).TotalSeconds;
+
+                if (isSameUser && secondsSinceLastScan < DEBOUNCE_SECONDS)
+                {
+                    return; 
+                }
+
                 var user = _userCache.FirstOrDefault(u => u.UserId == fid);
                 string fullName = user != null ? $"{user.FirstName} {user.LastName}".Trim() : $"User {fid}";
                 var req = new AttendanceRequest { FingerprintId = fid, TerminalId = _settings.TerminalId, Timestamp = DateTime.UtcNow };
@@ -182,6 +202,10 @@ namespace fingerprint_bridge
                 var result = await _syncService.SendAttendanceAsync(req);
                 if (result != null && (result.IsSuccess || result.IsNetworkError))
                 {
+                    // Update debounce markers on success
+                    _lastVerifiedFid = fid;
+                    _lastScanTime = DateTime.Now;
+
                     if (result.IsNetworkError)
                     {
                         _syncService.AddToQueue(req);
