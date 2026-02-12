@@ -87,7 +87,6 @@ namespace fingerprint_bridge
         private async Task CheckHardwareStatus()
         {
             if (mDevHandle != IntPtr.Zero || _isInitializing) return;
-
             int count = zkfp2.GetDeviceCount();
             if (count <= 0)
             {
@@ -95,7 +94,6 @@ namespace fingerprint_bridge
                 zkfp2.Init();
                 count = zkfp2.GetDeviceCount();
             }
-
             if (count > 0)
             {
                 _isInitializing = true;
@@ -114,13 +112,10 @@ namespace fingerprint_bridge
                     zkfp2.GetParameters(mDevHandle, 1, p, ref s2); zkfp2.ByteArray2Int(p, ref mfpWidth);
                     zkfp2.GetParameters(mDevHandle, 2, p, ref s2); zkfp2.ByteArray2Int(p, ref mfpHeight);
                     FPBuffer = new byte[mfpWidth * mfpHeight];
-
                     if (mDBHandle == IntPtr.Zero) mDBHandle = zkfp2.DBInit();
-
                     bIsTimeToDie = false;
                     captureThread = new Thread(DoCapture) { IsBackground = true, Priority = ThreadPriority.AboveNormal };
                     captureThread.Start();
-
                     UpdateStatus("Scanner Ready.", Color.Green);
                     this.Invoke(new Action(() => ToggleControls(true)));
                     Task.Run(() => SyncTemplatesBackground());
@@ -144,17 +139,13 @@ namespace fingerprint_bridge
             {
                 UpdateStatus("Connecting to Office Server...", Color.Orange);
                 _userCache = await _dbService.GetAllTemplatesAsync();
-
                 zkfp2.DBClear(mDBHandle);
-                foreach (var item in _userCache)
-                {
-                    zkfp2.DBAdd(mDBHandle, item.UserId, item.Template);
-                }
+                foreach (var item in _userCache) { zkfp2.DBAdd(mDBHandle, item.UserId, item.Template); }
                 UpdateStatus($"Sync Complete: {_userCache.Count} templates loaded.", Color.Green);
             }
             catch (Exception ex)
             {
-                UpdateStatus($"Sync Error: Ensure Office Server is reachable. {ex.Message}", Color.Red);
+                UpdateStatus($"Sync Error: {ex.Message}", Color.Red);
             }
         }
 
@@ -166,12 +157,7 @@ namespace fingerprint_bridge
                 int cb = 2048;
                 int ret = zkfp2.AcquireFingerprint(mDevHandle, FPBuffer, CapTmp, ref cb);
                 if (ret == 0) SendMessage(mFormHandle, MESSAGE_CAPTURED_OK, IntPtr.Zero, IntPtr.Zero);
-                else if (ret == -7)
-                {
-                    UpdateStatus("Hardware Disconnected.", Color.Red);
-                    this.Invoke(new Action(() => ToggleControls(false)));
-                    break;
-                }
+                else if (ret == -7) { break; }
                 Thread.Sleep(100);
             }
             CleanupDevice();
@@ -184,79 +170,39 @@ namespace fingerprint_bridge
 
             if (ret == zkfp.ZKFP_ERR_OK)
             {
-                // Debounce Logic: Check if it's the same person within the cooldown window
-                bool isSameUser = (fid == _lastVerifiedFid);
-                double secondsSinceLastScan = (DateTime.Now - _lastScanTime).TotalSeconds;
-
-                if (isSameUser && secondsSinceLastScan < DEBOUNCE_SECONDS)
-                {
-                    return; 
-                }
+                if (fid == _lastVerifiedFid && (DateTime.Now - _lastScanTime).TotalSeconds < DEBOUNCE_SECONDS) return;
 
                 var user = _userCache.FirstOrDefault(u => u.UserId == fid);
                 string fullName = user != null ? $"{user.FirstName} {user.LastName}".Trim() : $"User {fid}";
                 var req = new AttendanceRequest { FingerprintId = fid, TerminalId = _settings.TerminalId, Timestamp = DateTime.UtcNow };
 
-                UpdateStatus($"Verified: {fullName} (Score: {score})", Color.Blue);
+                UpdateStatus($"Verifying {fullName}...", Color.Blue);
 
                 var result = await _syncService.SendAttendanceAsync(req);
-                if (result != null && (result.IsSuccess || result.IsNetworkError))
+
+                if (result != null)
                 {
-                    // Update debounce markers on success
-                    _lastVerifiedFid = fid;
-                    _lastScanTime = DateTime.Now;
+                    if (result.IsSuccess || result.IsNetworkError) { _lastVerifiedFid = fid; _lastScanTime = DateTime.Now; }
 
                     if (result.IsNetworkError)
                     {
                         _syncService.AddToQueue(req);
-                        UpdateStatus($"[Offline] {fullName} queued (No Internet)", Color.Orange);
+                        UpdateStatus($"[OFFLINE] {fullName}: Queued locally.", Color.Orange);
+                        await TriggerFeedback(true);
+                    }
+                    else if (result.IsSuccess)
+                    {
+                        UpdateStatus($"[SERVER] {fullName}: {result.Message}", Color.Green);
+                        await TriggerFeedback(true);
                     }
                     else
                     {
-                        UpdateStatus($"[Cloud] Logged: {fullName}", Color.Green);
+                        UpdateStatus($"[REJECTED] {fullName}: {result.Message}", Color.Red);
+                        await TriggerFeedback(false);
                     }
-                    await TriggerFeedback(true);
-                }
-                else
-                {
-                    UpdateStatus($"[API Error] {result?.Message ?? "Unknown"}", Color.Red);
-                    await TriggerFeedback(false);
                 }
             }
-            else
-            {
-                UpdateStatus("Verify Failed: Unknown Finger.", Color.DarkRed);
-                await TriggerFeedback(false);
-            }
-        }
-
-        private void HandleEnroll()
-        {
-            Array.Copy(CapTmp, RegTmps[RegisterCount++], 2048);
-            if (RegisterCount >= 3)
-            {
-                int cb = 2048;
-                if (zkfp2.DBMerge(mDBHandle, RegTmps[0], RegTmps[1], RegTmps[2], RegTmp, ref cb) == zkfp.ZKFP_ERR_OK)
-                {
-                    string fName = txtFirstName.Text.Trim();
-                    string lName = txtLastName.Text.Trim();
-                    zkfp2.DBAdd(mDBHandle, iFid, RegTmp);
-                    _dbService.SaveTemplate(iFid, fName, lName, RegTmp);
-                    UpdateStatus($"Enroll Success: {fName} {lName} (ID: {iFid})", Color.Green);
-
-                    txtFirstName.Clear(); txtLastName.Clear(); txtUserId.Clear();
-                    Task.Run(() => SyncTemplatesBackground());
-                    IsRegister = false; RegisterCount = 0;
-                    _ = TriggerFeedback(true);
-                }
-                else
-                {
-                    UpdateStatus("Enroll Failed: Low quality. Try again.", Color.Red);
-                    IsRegister = false; RegisterCount = 0;
-                    _ = TriggerFeedback(false);
-                }
-            }
-            else UpdateStatus($"Scan {RegisterCount}/3 successful. Tap again...", Color.Blue);
+            else { UpdateStatus("Unknown Finger.", Color.DarkRed); await TriggerFeedback(false); }
         }
 
         private async Task ProcessOfflineQueueAsync()
@@ -267,20 +213,36 @@ namespace fingerprint_bridge
             foreach (var req in queue)
             {
                 var res = await _syncService.SendAttendanceAsync(req);
-                if (res.IsSuccess) { _syncService.RemoveFromQueue(req); successCount++; }
-                else if (res.IsNetworkError) break;
+                if (res.IsSuccess || !res.IsNetworkError) { _syncService.RemoveFromQueue(req); if (res.IsSuccess) successCount++; }
+                else break;
             }
-            if (successCount > 0) UpdateStatus($"[Sync] Backlog: {successCount} records uploaded.", Color.Teal);
+            if (successCount > 0) UpdateStatus($"[SYNC] {successCount} records uploaded.", Color.Teal);
+        }
+
+        private void HandleEnroll()
+        {
+            Array.Copy(CapTmp, RegTmps[RegisterCount++], 2048);
+            if (RegisterCount >= 3)
+            {
+                int cb = 2048;
+                if (zkfp2.DBMerge(mDBHandle, RegTmps[0], RegTmps[1], RegTmps[2], RegTmp, ref cb) == zkfp.ZKFP_ERR_OK)
+                {
+                    string fName = txtFirstName.Text.Trim(); string lName = txtLastName.Text.Trim();
+                    zkfp2.DBAdd(mDBHandle, iFid, RegTmp);
+                    _dbService.SaveTemplate(iFid, fName, lName, RegTmp);
+                    UpdateStatus($"Enroll Success: {fName} (ID: {iFid})", Color.Green);
+                    txtFirstName.Clear(); txtLastName.Clear(); txtUserId.Clear();
+                    Task.Run(() => SyncTemplatesBackground());
+                    IsRegister = false; RegisterCount = 0; _ = TriggerFeedback(true);
+                }
+                else { UpdateStatus("Enroll Failed. Try again.", Color.Red); IsRegister = false; RegisterCount = 0; _ = TriggerFeedback(false); }
+            }
+            else UpdateStatus($"Scan {RegisterCount}/3 successful...", Color.Blue);
         }
 
         private void CleanupDevice()
         {
-            if (mDevHandle != IntPtr.Zero)
-            {
-                IntPtr h = mDevHandle;
-                mDevHandle = IntPtr.Zero;
-                zkfp2.CloseDevice(h);
-            }
+            if (mDevHandle != IntPtr.Zero) { IntPtr h = mDevHandle; mDevHandle = IntPtr.Zero; zkfp2.CloseDevice(h); }
         }
 
         private void UpdateStatus(string t, Color c)
@@ -318,30 +280,26 @@ namespace fingerprint_bridge
             if (mDevHandle == IntPtr.Zero) return;
             byte[] on = new byte[4]; zkfp2.Int2ByteArray(1, on);
             byte[] off = new byte[4]; zkfp2.Int2ByteArray(0, off);
-            zkfp2.SetParameters(mDevHandle, 102, off, 4);
-            zkfp2.SetParameters(mDevHandle, 103, off, 4);
-            zkfp2.SetParameters(mDevHandle, 104, off, 4);
+            zkfp2.SetParameters(mDevHandle, 102, off, 4); zkfp2.SetParameters(mDevHandle, 103, off, 4); zkfp2.SetParameters(mDevHandle, 104, off, 4);
             await Task.Delay(30);
             if (success) zkfp2.SetParameters(mDevHandle, 102, on, 4); else zkfp2.SetParameters(mDevHandle, 103, on, 4);
             zkfp2.SetParameters(mDevHandle, 104, on, 4);
             await Task.Delay(1000);
-            zkfp2.SetParameters(mDevHandle, 102, off, 4);
-            zkfp2.SetParameters(mDevHandle, 103, off, 4);
-            zkfp2.SetParameters(mDevHandle, 104, off, 4);
+            zkfp2.SetParameters(mDevHandle, 102, off, 4); zkfp2.SetParameters(mDevHandle, 103, off, 4); zkfp2.SetParameters(mDevHandle, 104, off, 4);
         }
 
+        // --- UI EVENT HANDLERS (DO NOT REMOVE TO AVOID DESIGNER ERRORS) ---
         public void bnInit_Click(object sender, EventArgs e) => _ = CheckHardwareStatus();
         public void bnOpen_Click(object sender, EventArgs e) => _ = CheckHardwareStatus();
         public void btnClearLogs_Click(object sender, EventArgs e) => textRes.Clear();
         public void bnEnroll_Click(object sender, EventArgs e)
         {
-            if (string.IsNullOrWhiteSpace(txtFirstName.Text)) { UpdateStatus("Error: First Name is required.", Color.Red); return; }
+            if (string.IsNullOrWhiteSpace(txtFirstName.Text)) { UpdateStatus("Error: Name required.", Color.Red); return; }
             if (!int.TryParse(txtUserId.Text, out iFid)) { iFid = (_userCache.Count > 0) ? _userCache.Max(u => u.UserId) + 1 : 1; txtUserId.Text = iFid.ToString(); }
-            IsRegister = true; RegisterCount = 0; UpdateStatus($"Enrollment started for {txtFirstName.Text}. Tap 3 times.", Color.Orange);
+            IsRegister = true; RegisterCount = 0; UpdateStatus($"Enroll {txtFirstName.Text}: Tap 3 times.", Color.Orange);
         }
         public void bnVerify_Click(object sender, EventArgs e) { IsRegister = false; UpdateStatus("Mode: Verification.", Color.Black); }
         public void bnClose_Click(object sender, EventArgs e) { bIsTimeToDie = true; CleanupDevice(); ToggleControls(false); UpdateStatus("Scanner Closed.", Color.Red); }
-
         private void label4_Click(object sender, EventArgs e) { }
         private void txtFirstName_TextChanged(object sender, EventArgs e) { }
         private void txtLastName_TextChanged(object sender, EventArgs e) { }
