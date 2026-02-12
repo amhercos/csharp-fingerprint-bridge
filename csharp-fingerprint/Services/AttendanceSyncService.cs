@@ -16,6 +16,15 @@ namespace fingerprint_bridge.Services
         public string Message { get; set; }
     }
 
+    // This matches the DTO structure returned by your ASP.NET API
+    public class ApiResponseDto
+    {
+        public string Message { get; set; }
+        public string Direction { get; set; }
+        public DateTime? Timestamp { get; set; }
+        public string Name { get; set; }
+    }
+
     public class AttendanceSyncService
     {
         private readonly HttpClient _httpClient;
@@ -36,17 +45,49 @@ namespace fingerprint_bridge.Services
             {
                 var json = JsonConvert.SerializeObject(req);
                 var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+                // Calling your Cloud/Office API
                 var response = await _httpClient.PostAsync("https://master-api.amsentry.dev/api/fingerprint/log-attendance", content);
 
+                // Read the response body to get the "Message" from your AttendanceProcessingService
+                var responseBody = await response.Content.ReadAsStringAsync();
+                var apiData = JsonConvert.DeserializeObject<ApiResponseDto>(responseBody);
+
+                // Use the message from API if available, otherwise use default reason
+                string serverMessage = apiData?.Message ?? response.ReasonPhrase;
+
                 if (response.IsSuccessStatusCode)
-                    return new SyncResult { IsSuccess = true, IsNetworkError = false, Message = "Success" };
+                {
+                    return new SyncResult
+                    {
+                        IsSuccess = true,
+                        IsNetworkError = false,
+                        Message = serverMessage
+                    };
+                }
 
+                // If it's a 4xx error (Conflict, Not Found, etc.)
                 if ((int)response.StatusCode >= 400 && (int)response.StatusCode < 500)
-                    return new SyncResult { IsSuccess = false, IsNetworkError = false, Message = $"Rejected: {response.StatusCode}" };
+                {
+                    return new SyncResult
+                    {
+                        IsSuccess = false,
+                        IsNetworkError = false,
+                        Message = serverMessage
+                    };
+                }
 
-                return new SyncResult { IsSuccess = false, IsNetworkError = true, Message = "Server Error" };
+                // Server-side crash (500)
+                return new SyncResult { IsSuccess = false, IsNetworkError = true, Message = "Server Error (500)" };
             }
-            catch { return new SyncResult { IsSuccess = false, IsNetworkError = true, Message = "Network Down" }; }
+            catch (HttpRequestException)
+            {
+                return new SyncResult { IsSuccess = false, IsNetworkError = true, Message = "Network Down" };
+            }
+            catch (Exception ex)
+            {
+                return new SyncResult { IsSuccess = false, IsNetworkError = true, Message = $"Error: {ex.Message}" };
+            }
         }
 
         public void AddToQueue(AttendanceRequest req) { lock (_lock) { _offlineQueue.Add(req); PersistQueue(); } }
@@ -57,14 +98,19 @@ namespace fingerprint_bridge.Services
         {
             if (File.Exists(_queueFilePath)) try
                 {
-                    _offlineQueue = JsonConvert.DeserializeObject<List<AttendanceRequest>>(File.ReadAllText(_queueFilePath)) ?? new List<AttendanceRequest>();
+                    var text = File.ReadAllText(_queueFilePath);
+                    _offlineQueue = JsonConvert.DeserializeObject<List<AttendanceRequest>>(text) ?? new List<AttendanceRequest>();
                 }
-                catch { }
+                catch { _offlineQueue = new List<AttendanceRequest>(); }
         }
 
         public void PersistQueue()
         {
-            lock (_lock) File.WriteAllText(_queueFilePath, JsonConvert.SerializeObject(_offlineQueue, Formatting.Indented));
+            lock (_lock)
+            {
+                var json = JsonConvert.SerializeObject(_offlineQueue, Formatting.Indented);
+                File.WriteAllText(_queueFilePath, json);
+            }
         }
     }
 }
