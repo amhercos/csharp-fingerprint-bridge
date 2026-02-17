@@ -174,7 +174,7 @@ namespace fingerprint_bridge
 
                 var user = _userCache.FirstOrDefault(u => u.UserId == fid);
                 string fullName = user != null ? $"{user.FirstName} {user.LastName}".Trim() : $"User {fid}";
-                var req = new AttendanceRequest { FingerprintId = fid, TerminalId = _settings.TerminalId, Timestamp = DateTime.UtcNow };
+                var req = new AttendanceRequest { EmployeeId = fid, TerminalId = _settings.TerminalId, Timestamp = DateTime.UtcNow };
 
                 UpdateStatus($"Verifying {fullName}...", Color.Blue);
 
