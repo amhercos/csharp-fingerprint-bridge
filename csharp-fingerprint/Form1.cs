@@ -7,6 +7,7 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using System.Diagnostics;
 using Newtonsoft.Json;
 using libzkfpcsharp;
 using fingerprint_bridge.Models;
@@ -36,7 +37,6 @@ namespace fingerprint_bridge
         private const int MESSAGE_CAPTURED_OK = 0x0400 + 6;
         private bool _isInitializing = false;
 
-        // Debounce variables
         private int _lastVerifiedFid = -1;
         private DateTime _lastScanTime = DateTime.MinValue;
         private const int DEBOUNCE_SECONDS = 5;
@@ -53,21 +53,44 @@ namespace fingerprint_bridge
         private void SetupApp()
         {
             string configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "settings.json");
-            _settings = File.Exists(configPath) ? JsonConvert.DeserializeObject<AppSettings>(File.ReadAllText(configPath)) : new AppSettings();
-            _dbService = new DatabaseService(_settings);
-            _syncService = new AttendanceSyncService();
 
-            zkfp2.Init();
+            try
+            {
+                // 1. Load or Create Settings
+                if (File.Exists(configPath))
+                {
+                    string jsonContent = File.ReadAllText(configPath);
+                    _settings = JsonConvert.DeserializeObject<AppSettings>(jsonContent) ?? new AppSettings();
+                }
+                else
+                {
+                    _settings = new AppSettings();
+                    File.WriteAllText(configPath, JsonConvert.SerializeObject(_settings, Formatting.Indented));
+                    UpdateStatus("New configuration file initialized.", Color.Orange);
+                }
 
-            var watchdog = new System.Windows.Forms.Timer { Interval = 3000 };
-            watchdog.Tick += async (s, e) => await CheckHardwareStatus();
-            watchdog.Start();
+                // 2. Initialize Core Services
+                _dbService = new DatabaseService(_settings);
+                _syncService = new AttendanceSyncService();
 
-            var retryTimer = new System.Windows.Forms.Timer { Interval = 20000 };
-            retryTimer.Tick += async (s, e) => await ProcessOfflineQueueAsync();
-            retryTimer.Start();
+                // 3. Initialize ZKTeco SDK
+                zkfp2.Init();
 
-            ToggleControls(false);
+                // 4. Start Maintenance Timers
+                var watchdog = new System.Windows.Forms.Timer { Interval = 3000 };
+                watchdog.Tick += async (s, e) => await CheckHardwareStatus();
+                watchdog.Start();
+
+                var retryTimer = new System.Windows.Forms.Timer { Interval = 20000 };
+                retryTimer.Tick += async (s, e) => await ProcessOfflineQueueAsync();
+                retryTimer.Start();
+
+                ToggleControls(false);
+            }
+            catch (Exception ex)
+            {
+                UpdateStatus($"Critical Startup Error: {ex.Message}", Color.Red);
+            }
         }
 
         private void Form1_Load(object sender, EventArgs e)
@@ -82,6 +105,12 @@ namespace fingerprint_bridge
                 CleanupDevice();
                 zkfp2.Terminate();
             };
+        }
+
+        private void OpenConfigFolder()
+        {
+            string appPath = AppDomain.CurrentDomain.BaseDirectory;
+            if (Directory.Exists(appPath)) Process.Start("explorer.exe", appPath);
         }
 
         private async Task CheckHardwareStatus()
@@ -137,11 +166,11 @@ namespace fingerprint_bridge
         {
             try
             {
-                UpdateStatus("Connecting to Office Server...", Color.Orange);
+                UpdateStatus("Syncing local cache with server...", Color.Black);
                 _userCache = await _dbService.GetAllTemplatesAsync();
                 zkfp2.DBClear(mDBHandle);
                 foreach (var item in _userCache) { zkfp2.DBAdd(mDBHandle, item.UserId, item.Template); }
-                UpdateStatus($"Sync Complete: {_userCache.Count} templates loaded.", Color.Green);
+                UpdateStatus($"Database Sync: {_userCache.Count} users loaded.", Color.Green);
             }
             catch (Exception ex)
             {
@@ -176,7 +205,7 @@ namespace fingerprint_bridge
                 string fullName = user != null ? $"{user.FirstName} {user.LastName}".Trim() : $"User {fid}";
                 var req = new AttendanceRequest { EmployeeId = fid, TerminalId = _settings.TerminalId, Timestamp = DateTime.UtcNow };
 
-                UpdateStatus($"Verifying {fullName}...", Color.Blue);
+                UpdateStatus($"Identifying: {fullName}...", Color.Blue);
 
                 var result = await _syncService.SendAttendanceAsync(req);
 
@@ -187,7 +216,7 @@ namespace fingerprint_bridge
                     if (result.IsNetworkError)
                     {
                         _syncService.AddToQueue(req);
-                        UpdateStatus($"[OFFLINE] {fullName}: Queued locally.", Color.Orange);
+                        UpdateStatus($"[OFFLINE] {fullName}: Saved to local queue.", Color.Orange);
                         await TriggerFeedback(true);
                     }
                     else if (result.IsSuccess)
@@ -202,7 +231,7 @@ namespace fingerprint_bridge
                     }
                 }
             }
-            else { UpdateStatus("Unknown Finger.", Color.DarkRed); await TriggerFeedback(false); }
+            else { UpdateStatus("Unknown Fingerprint.", Color.DarkRed); await TriggerFeedback(false); }
         }
 
         private async Task ProcessOfflineQueueAsync()
@@ -216,7 +245,7 @@ namespace fingerprint_bridge
                 if (res.IsSuccess || !res.IsNetworkError) { _syncService.RemoveFromQueue(req); if (res.IsSuccess) successCount++; }
                 else break;
             }
-            if (successCount > 0) UpdateStatus($"[SYNC] {successCount} records uploaded.", Color.Teal);
+            if (successCount > 0) UpdateStatus($"[SYNC] {successCount} offline records uploaded.", Color.Teal);
         }
 
         private void HandleEnroll()
@@ -235,7 +264,7 @@ namespace fingerprint_bridge
                     Task.Run(() => SyncTemplatesBackground());
                     IsRegister = false; RegisterCount = 0; _ = TriggerFeedback(true);
                 }
-                else { UpdateStatus("Enroll Failed. Try again.", Color.Red); IsRegister = false; RegisterCount = 0; _ = TriggerFeedback(false); }
+                else { UpdateStatus("Enrollment Failed. Try again.", Color.Red); IsRegister = false; RegisterCount = 0; _ = TriggerFeedback(false); }
             }
             else UpdateStatus($"Scan {RegisterCount}/3 successful...", Color.Blue);
         }
@@ -288,7 +317,6 @@ namespace fingerprint_bridge
             zkfp2.SetParameters(mDevHandle, 102, off, 4); zkfp2.SetParameters(mDevHandle, 103, off, 4); zkfp2.SetParameters(mDevHandle, 104, off, 4);
         }
 
-        // --- UI EVENT HANDLERS (DO NOT REMOVE TO AVOID DESIGNER ERRORS) ---
         public void bnInit_Click(object sender, EventArgs e) => _ = CheckHardwareStatus();
         public void bnOpen_Click(object sender, EventArgs e) => _ = CheckHardwareStatus();
         public void btnClearLogs_Click(object sender, EventArgs e) => textRes.Clear();
@@ -296,10 +324,10 @@ namespace fingerprint_bridge
         {
             if (string.IsNullOrWhiteSpace(txtFirstName.Text)) { UpdateStatus("Error: Name required.", Color.Red); return; }
             if (!int.TryParse(txtUserId.Text, out iFid)) { iFid = (_userCache.Count > 0) ? _userCache.Max(u => u.UserId) + 1 : 1; txtUserId.Text = iFid.ToString(); }
-            IsRegister = true; RegisterCount = 0; UpdateStatus($"Enroll {txtFirstName.Text}: Tap 3 times.", Color.Orange);
+            IsRegister = true; RegisterCount = 0; UpdateStatus($"Enrollment started for {txtFirstName.Text}.", Color.Orange);
         }
-        public void bnVerify_Click(object sender, EventArgs e) { IsRegister = false; UpdateStatus("Mode: Verification.", Color.Black); }
-        public void bnClose_Click(object sender, EventArgs e) { bIsTimeToDie = true; CleanupDevice(); ToggleControls(false); UpdateStatus("Scanner Closed.", Color.Red); }
+        public void bnVerify_Click(object sender, EventArgs e) { IsRegister = false; UpdateStatus("Verification Mode active.", Color.Black); }
+        public void bnClose_Click(object sender, EventArgs e) { bIsTimeToDie = true; CleanupDevice(); ToggleControls(false); UpdateStatus("Scanner Deactivated.", Color.Red); }
         private void label4_Click(object sender, EventArgs e) { }
         private void txtFirstName_TextChanged(object sender, EventArgs e) { }
         private void txtLastName_TextChanged(object sender, EventArgs e) { }
