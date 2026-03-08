@@ -34,6 +34,7 @@
             this.label2 = new System.Windows.Forms.Label();
             this.label3 = new System.Windows.Forms.Label();
             this.label4 = new System.Windows.Forms.Label();
+            this.button1 = new System.Windows.Forms.Button();
             ((System.ComponentModel.ISupportInitialize)(this.picFPImg)).BeginInit();
             this.SuspendLayout();
             // 
@@ -107,11 +108,11 @@
             // 
             // textRes
             // 
-            this.textRes.Location = new System.Drawing.Point(24, 212);
+            this.textRes.Location = new System.Drawing.Point(26, 233);
             this.textRes.Margin = new System.Windows.Forms.Padding(6);
             this.textRes.Name = "textRes";
             this.textRes.ReadOnly = true;
-            this.textRes.Size = new System.Drawing.Size(916, 285);
+            this.textRes.Size = new System.Drawing.Size(916, 275);
             this.textRes.TabIndex = 7;
             this.textRes.Text = "";
             // 
@@ -195,11 +196,22 @@
             this.label4.Text = "Fingerprint ID :";
             this.label4.Click += new System.EventHandler(this.label4_Click);
             // 
+            // button1
+            // 
+            this.button1.Location = new System.Drawing.Point(24, 184);
+            this.button1.Name = "button1";
+            this.button1.Size = new System.Drawing.Size(150, 40);
+            this.button1.TabIndex = 18;
+            this.button1.Text = "Open Config";
+            this.button1.UseVisualStyleBackColor = true;
+            this.button1.Click += new System.EventHandler(this.btnOpenFolder_Click);
+            // 
             // Form1
             // 
             this.AutoScaleDimensions = new System.Drawing.SizeF(12F, 25F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
             this.ClientSize = new System.Drawing.Size(968, 523);
+            this.Controls.Add(this.button1);
             this.Controls.Add(this.label4);
             this.Controls.Add(this.label3);
             this.Controls.Add(this.label2);
@@ -243,5 +255,6 @@
         private System.Windows.Forms.Label label2;
         private System.Windows.Forms.Label label3;
         private System.Windows.Forms.Label label4;
+        private System.Windows.Forms.Button button1;
     }
 }

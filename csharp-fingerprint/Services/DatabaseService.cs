@@ -22,6 +22,21 @@ namespace fingerprint_bridge.Services
                 $"Keepalive=15;";
         }
 
+        public async Task<int> GetServerTemplateCountAsync()
+        {
+            try
+            {
+                using (var conn = new NpgsqlConnection(_connString))
+                {
+                    await conn.OpenAsync();
+                    using (var cmd = new NpgsqlCommand("SELECT COUNT(*) FROM user_fingerprints", conn))
+                    {
+                        return Convert.ToInt32(await cmd.ExecuteScalarAsync());
+                    }
+                }
+            }
+            catch { return -1; } // Return -1 if the network is down
+        }
         public async Task<List<FingerprintTemplate>> GetAllTemplatesAsync()
         {
             var list = new List<FingerprintTemplate>();
